@@ -541,7 +541,9 @@ export async function weeklyCleanup(db) {
 }
 
 export async function saveMetricsHistory(db, serverId, historyPartitionId, metrics, regionCode = '', timestamp = null, agentVersion = '') {
-  const historyId = buildHistoryId(historyPartitionId, timestamp);
+  // history_id 的时间键只精确到秒（YYMMDDHHMMSS），同一秒内的多条上报会主键冲突，
+  // 后写入的记录被 SQLite 静默丢弃。这里加一个进程内自增后缀保证同秒内 ID 唯一。
+  let historyId = buildHistoryId(historyPartitionId, timestamp);
   const rawTimestamp = Number(timestamp);
   const now = Number.isFinite(rawTimestamp) && rawTimestamp > 0
     ? (rawTimestamp < 10000000000 ? rawTimestamp * 1000 : rawTimestamp)
@@ -631,6 +633,22 @@ export async function saveMetricsHistory(db, serverId, historyPartitionId, metri
   try {
     await insertHistoryRow();
   } catch (e) {
+    // 主键冲突（同一秒内多条上报）：history_id 依次 +1 重试，最多 5 次
+    const isPkConflict = e?.message && /UNIQUE constraint failed|PRIMARY KEY|constraint failed/i.test(e.message);
+    if (isPkConflict) {
+      for (let offset = 1; offset <= 5; offset++) {
+        try {
+          historyId = historyId + offset;
+          await insertHistoryRow();
+          return;
+        } catch (retryErr) {
+          if (offset === 5) {
+            console.error('保存历史数据失败(主键冲突重试耗尽):', retryErr);
+          }
+        }
+      }
+      return;
+    }
     if (e?.message && /has no column/i.test(e.message)) {
       console.warn('检测到数据库字段缺失，尝试添加缺失字段...');
       await addHistoryColumns(db);
@@ -655,14 +673,26 @@ export async function getLatestMetrics(db, serverId, server = null) {
     const rangeStart = historyInfo.startTimestamp > 0 ? historyInfo.startTimestamp : null;
     const { startId, endId } = getHistoryIdRange(historyInfo.partitionId, rangeStart);
     debug(`Server ${serverId} history_id_range: ${startId} - ${endId}`);
-  
-    const result = await db.prepare(`
+
+    const SELECT_LATEST = `
       SELECT * FROM metrics_history
       WHERE id >= ?
         AND id <= ?
       ORDER BY id DESC
       LIMIT 1
-    `).bind(startId, endId).first();
+    `;
+
+    let result = await db.prepare(SELECT_LATEST).bind(startId, endId).first();
+
+    // servers.timestamp 可能在安装后就不再刷新，导致查询下界停留在旧时间点，
+    // 之后写入的记录全部落在查询范围之外，面板永远显示旧数据/离线。
+    // 若范围内查不到记录，回退到整个分区重新取最新一条。
+    if (!result && rangeStart !== null) {
+      const fallback = getHistoryIdRange(historyInfo.partitionId, null);
+      debug(`Server ${serverId} history_id_range fallback: ${fallback.startId} - ${fallback.endId}`);
+      result = await db.prepare(SELECT_LATEST).bind(fallback.startId, fallback.endId).first();
+    }
+
     return result ? normalizeProbeMetricRow(result) : null;
   } catch (e) {
     console.error('获取最新指标数据失败:', e);
